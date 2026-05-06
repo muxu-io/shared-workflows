@@ -1,0 +1,42 @@
+name: 'Docker Lint'
+description: 'Lint Dockerfiles using hadolint to enforce best practices'
+
+inputs:
+  dockerfile-path:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
+  working-directory:
+    description: 'Working directory'
+    required: false
+    default: '.'
+  config-file:
+    description: 'Path to .hadolint.yaml config file (relative to working-directory)'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install hadolint
+      shell: bash
+      run: |
+        HADOLINT_VERSION="v2.12.0"
+        ARCH=$(dpkg --print-architecture)
+        case "${ARCH}" in
+          amd64) HADOLINT_ARCH="x86_64" ;;
+          arm64) HADOLINT_ARCH="arm64" ;;
+          *) echo "Unsupported architecture: ${ARCH}" >&2; exit 1 ;;
+        esac
+        curl -sfL "https://github.com/hadolint/hadolint/releases/download/${HADOLINT_VERSION}/hadolint-Linux-${HADOLINT_ARCH}" -o /usr/local/bin/hadolint
+        chmod +x /usr/local/bin/hadolint
+        hadolint --version
+
+    - name: Lint Dockerfile
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        ARGS=(--failure-threshold error)
+        if [ -n "${{ inputs.config-file }}" ] && [ -f "${{ inputs.config-file }}" ]; then
+          ARGS+=("--config" "${{ inputs.config-file }}")
+        fi
+        hadolint "${ARGS[@]}" "${{ inputs.dockerfile-path }}"

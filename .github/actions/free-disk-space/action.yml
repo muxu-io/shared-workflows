@@ -1,0 +1,55 @@
+name: 'Free Disk Space'
+description: 'Free up disk space on GitHub runners by removing unnecessary bloat'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Ensure Docker client compatibility
+      # Only needed on GitHub-hosted runners, where the bundled docker-ce-cli
+      # lags the daemon. Skipped on self-hosted runners that already ship a
+      # supervised dockerd — reinstalling the CLI there can disrupt the
+      # daemon and SIGTERM the running job.
+      if: runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        sudo apt-get update -qq >/dev/null 2>&1
+        sudo apt-get install -y -qq docker-ce-cli >/dev/null 2>&1
+
+    - name: Free up disk space
+      shell: bash
+      run: |
+        echo "Disk space before cleanup:"
+        df -h
+
+        # Aggressive Docker cleanup
+        docker system prune -a -f || true
+        docker builder prune -a -f || true
+
+        # Remove large directories commonly present in GitHub runners
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/graalvm || true
+        sudo rm -rf /usr/local/share/boost /usr/local/lib/android || true
+        sudo rm -rf /usr/share/swift /opt/hostedtoolcache || true
+        sudo rm -rf /usr/local/.ghcup /usr/local/share/chromium || true
+
+        # Recreate /opt/hostedtoolcache writable by the runner user so that
+        # subsequent actions/setup-* steps can populate it without sudo.
+        sudo mkdir -p /opt/hostedtoolcache
+        sudo chown "$(id -u):$(id -g)" /opt/hostedtoolcache
+
+        # Remove more GitHub runner bloat
+        sudo rm -rf /usr/share/miniconda /usr/share/gradle* || true
+        sudo rm -rf /opt/microsoft /opt/az /opt/pipx_bin || true
+
+        # Clean Cargo cache (important for Rust builds)
+        # Use sudo since cargo files may have been created with elevated permissions
+        sudo rm -rf ~/.cargo/registry ~/.cargo/git || true
+        sudo rm -rf ~/.cargo/.package-cache || true
+
+        # Clean package manager cache aggressively
+        sudo apt-get clean
+        sudo apt-get autoremove -y
+        sudo rm -rf /var/lib/apt/lists/*
+        sudo rm -rf /tmp/* /var/tmp/* || true
+
+        echo "Available disk space after cleanup:"
+        df -h

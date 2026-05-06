@@ -1,0 +1,85 @@
+name: 'Security Scan'
+description: 'Python security checks including Bandit, pip-audit, and TruffleHog secret detection'
+inputs:
+  working-directory:
+    description: 'Working directory for Python project'
+    required: false
+    default: '.'
+  system-dependencies:
+    description: 'Additional system dependencies to install (space-separated)'
+    required: false
+    default: ''
+  pip-audit-ignore-vulns:
+    description: 'Space-separated list of vulnerability IDs to ignore in pip-audit'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: Install system dependencies
+      if: inputs.system-dependencies
+      run: |
+        echo "Installing additional system dependencies: ${{ inputs.system-dependencies }}"
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.system-dependencies }}
+      shell: bash
+
+    - name: Install dependencies
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Installing Poetry and dependencies"
+        python -m pip install --upgrade pip poetry
+
+        # Configure Poetry to use in-project virtual environment
+        poetry config virtualenvs.create true
+        poetry config virtualenvs.in-project true
+
+        poetry install --with dev
+
+        # Upgrade pip inside the Poetry venv to fix known vulnerabilities
+        poetry run pip install --upgrade pip
+      shell: bash
+
+    - name: Security scan with Bandit
+      working-directory: ${{ inputs.working-directory }}
+      run: poetry run bandit -r src/ -f json -o bandit-report.json || poetry run bandit -r src/
+      shell: bash
+
+    - name: Display Bandit security report
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Bandit Security Scan Results:"
+        if [ -f bandit-report.json ]; then
+          cat bandit-report.json | jq . || cat bandit-report.json
+        else
+          echo "No bandit-report.json found - check previous step"
+        fi
+      continue-on-error: true
+      shell: bash
+
+    - name: Check for known vulnerabilities
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Scanning dependencies for known vulnerabilities..."
+        IGNORE_FLAGS=""
+        if [ -n "${{ inputs.pip-audit-ignore-vulns }}" ]; then
+          for vuln in ${{ inputs.pip-audit-ignore-vulns }}; do
+            IGNORE_FLAGS="$IGNORE_FLAGS --ignore-vuln $vuln"
+          done
+        fi
+        # Use local mode to audit installed packages (supports private packages)
+        poetry run pip-audit --local --format=json --output=vulnerability-report.json $IGNORE_FLAGS || poetry run pip-audit --local $IGNORE_FLAGS
+      shell: bash
+
+    - name: Scan for secrets with TruffleHog
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ${{ github.workspace }}
+        base: ""
+        extra_args: --debug --only-verified

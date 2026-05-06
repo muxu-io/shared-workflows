@@ -1,0 +1,61 @@
+name: 'Testing'
+description: 'Python testing with pytest and configurable timeout'
+inputs:
+  python-version:
+    description: 'Python version being tested'
+    required: false
+    default: '3.11'
+  timeout:
+    description: 'Test timeout in seconds'
+    required: false
+    default: '600'
+  working-directory:
+    description: 'Working directory for Python project'
+    required: false
+    default: '.'
+  system-dependencies:
+    description: 'Additional system dependencies to install (space-separated)'
+    required: false
+    default: ''
+  pytest-args:
+    description: 'Additional pytest arguments (e.g., "-s" for output, "-vv" for very verbose)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install system dependencies
+      if: inputs.system-dependencies
+      run: |
+        echo "Installing additional system dependencies: ${{ inputs.system-dependencies }}"
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.system-dependencies }}
+      shell: bash
+
+    - name: Install dependencies
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Installing Poetry and dependencies"
+        python -m pip install --upgrade pip poetry
+
+        # Configure Poetry to use in-project virtual environment
+        poetry config virtualenvs.create true
+        poetry config virtualenvs.in-project true
+
+        poetry install --with dev
+      shell: bash
+
+    - name: Test with pytest
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Starting pytest with timeout protection..."
+        timeout ${{ inputs.timeout }} poetry run pytest -v --tb=short --maxfail=5 -x ${{ inputs.pytest-args }}
+      env:
+        PYTEST_TIMEOUT: 30
+      shell: bash

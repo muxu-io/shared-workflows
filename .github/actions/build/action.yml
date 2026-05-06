@@ -1,0 +1,63 @@
+name: 'Build'
+description: 'Python package building and validation with artifact upload'
+inputs:
+  python-version:
+    description: 'Python version being tested'
+    required: false
+    default: '3.11'
+  working-directory:
+    description: 'Working directory for Python project'
+    required: false
+    default: '.'
+  system-dependencies:
+    description: 'Additional system dependencies to install (space-separated)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install system dependencies
+      if: inputs.system-dependencies
+      run: |
+        echo "Installing additional system dependencies: ${{ inputs.system-dependencies }}"
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.system-dependencies }}
+      shell: bash
+
+    - name: Install build dependencies
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Installing Poetry and dependencies"
+        python -m pip install --upgrade pip poetry
+
+        # Configure Poetry to use in-project virtual environment
+        poetry config virtualenvs.create true
+        poetry config virtualenvs.in-project true
+
+        poetry install
+      shell: bash
+
+    - name: Build package
+      working-directory: ${{ inputs.working-directory }}
+      run: poetry build
+      shell: bash
+
+
+    - name: Extract component name
+      id: component
+      run: |
+        component_name=$(basename "${{ inputs.working-directory }}")
+        echo "name=${component_name}" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: python-package-${{ inputs.python-version }}-${{ steps.component.outputs.name }}
+        path: ${{ inputs.working-directory }}/dist/

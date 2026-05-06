@@ -1,0 +1,340 @@
+name: Reusable Docker Publish
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON-encoded runner label (e.g. '"ubuntu-latest"') or label array
+          (e.g. '["self-hosted","linux"]'). Empty = use vars.CI_RUNNER or
+          ubuntu-latest.
+        required: false
+        type: string
+        default: ''
+      registry:
+        description: 'Container registry (e.g., ghcr.io, docker.io, quay.io)'
+        required: false
+        type: string
+        default: 'ghcr.io'
+      image-name:
+        description: 'Image name without registry prefix (e.g., owner/repo)'
+        required: true
+        type: string
+      version:
+        description: 'Version tag to publish'
+        required: true
+        type: string
+      dockerfile:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      context:
+        description: 'Docker build context'
+        required: false
+        type: string
+        default: '.'
+      build-args:
+        description: 'Build arguments (KEY=value format, one per line)'
+        required: false
+        type: string
+      target:
+        description: 'Target stage in multi-stage Dockerfile'
+        required: false
+        type: string
+      submodules:
+        description: 'Checkout git submodules (true, false, or recursive)'
+        required: false
+        type: boolean
+        default: false
+      platforms:
+        description: 'JSON array of platform configs, e.g., [{"arch":"linux/amd64","runner":"ubuntu-latest"}]'
+        required: false
+        type: string
+        default: '[{"arch":"linux/amd64","runner":"ubuntu-latest"}]'
+    outputs:
+      image-digest:
+        description: 'Published image digest'
+        value: ${{ jobs.merge.outputs.digest }}
+      full-image-name:
+        description: 'Full image name with registry and tag'
+        value: ${{ jobs.prepare.outputs.full-image }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    outputs:
+      full-image: ${{ steps.prepare.outputs.full-image }}
+      full-image-base: ${{ steps.prepare.outputs.full-image-base }}
+      registry: ${{ steps.prepare.outputs.registry }}
+      update-latest: ${{ steps.prepare.outputs.update-latest }}
+      tags: ${{ steps.meta.outputs.tags }}
+      labels: ${{ steps.meta.outputs.labels }}
+      version: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Prepare image names and registry
+        id: prepare
+        shell: bash
+        run: |
+          # Prepare full image names
+          REGISTRY="${{ inputs.registry }}"
+          IMAGE_NAME="${{ inputs.image-name }}"
+          VERSION="${{ inputs.version }}"
+
+          # Construct full image name
+          if [[ "$REGISTRY" == "docker.io" ]] || [[ -z "$REGISTRY" ]]; then
+            FULL_IMAGE="$IMAGE_NAME"
+          else
+            FULL_IMAGE="$REGISTRY/$IMAGE_NAME"
+          fi
+
+          FULL_IMAGE_VERSIONED="$FULL_IMAGE:$VERSION"
+
+          {
+            echo "full-image=$FULL_IMAGE_VERSIONED"
+            echo "full-image-base=$FULL_IMAGE"
+            echo "registry=$REGISTRY"
+          } >> "$GITHUB_OUTPUT"
+
+          # Generate registry URL for environment
+          if [[ "$REGISTRY" == "ghcr.io" ]]; then
+            echo "registry-url=https://ghcr.io/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          elif [[ "$REGISTRY" == "docker.io" ]] || [[ -z "$REGISTRY" ]]; then
+            echo "registry-url=https://hub.docker.com/r/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "registry-url=https://$REGISTRY/$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Auto-detect if we should update the latest tag
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+
+          if [[ "$BRANCH_NAME" == "master" || "$BRANCH_NAME" == "main" ]]; then
+            UPDATE_LATEST="true"
+          elif [[ "$BRANCH_NAME" =~ ^[0-9]+\.x$ || "$BRANCH_NAME" =~ ^[0-9]+\.[0-9]+\.x$ ]]; then
+            UPDATE_LATEST="false"
+          else
+            UPDATE_LATEST="true"
+          fi
+
+          echo "update-latest=$UPDATE_LATEST" >> "$GITHUB_OUTPUT"
+
+          if [[ "$UPDATE_LATEST" == "true" ]]; then
+            echo "Will publish: $FULL_IMAGE_VERSIONED and latest"
+          else
+            echo "Will publish: $FULL_IMAGE_VERSIONED (latest tag skipped - maintenance branch: $BRANCH_NAME)"
+          fi
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.prepare.outputs.full-image-base }}
+          tags: |
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=latest,enable=${{ steps.prepare.outputs.update-latest == 'true' }}
+          labels: |
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.created={{date 'YYYY-MM-DDTHH:mm:ssZ'}}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  lint:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Lint Dockerfile
+        uses: muxu-io/shared-workflows/.github/actions/docker-lint@master
+        with:
+          dockerfile-path: ${{ inputs.dockerfile }}
+          working-directory: ${{ inputs.context }}
+
+  build:
+    needs: [prepare, lint]
+    strategy:
+      fail-fast: true
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms) }}
+    runs-on: ${{ matrix.platform.runner }}
+    environment:
+      name: docker-publish
+      url: https://${{ needs.prepare.outputs.registry }}/${{ inputs.image-name }}
+    steps:
+      - name: Generate GitHub App Token
+        if: inputs.submodules
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: v${{ inputs.version }}
+          lfs: true
+          submodules: ${{ inputs.submodules }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Free up disk space
+        uses: muxu-io/shared-workflows/.github/actions/free-disk-space@master
+
+      - name: Ensure Docker client compatibility
+        run: |
+          # Fix Docker client/daemon API version mismatch on GitHub runners
+          sudo apt-get update -qq >/dev/null 2>&1
+          sudo apt-get install -y -qq docker-ce-cli >/dev/null 2>&1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry == 'ghcr.io' && github.actor || secrets.registry-username }}
+          password: ${{ inputs.registry == 'ghcr.io' && secrets.GITHUB_TOKEN || secrets.registry-password }}
+
+      - name: Compute slugs for artifact naming
+        id: platform
+        run: |
+          PLATFORM="${{ matrix.platform.arch }}"
+          echo "pair=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+          IMAGE_NAME="${{ inputs.image-name }}"
+          echo "image-slug=${IMAGE_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          platforms: ${{ matrix.platform.arch }}
+          push: true
+          tags: ""
+          labels: ${{ needs.prepare.outputs.labels }}
+          build-args: |
+            VERSION=${{ inputs.version }}
+            VCS_REF=${{ github.sha }}
+            ${{ inputs.build-args }}
+          outputs: type=image,name=${{ needs.prepare.outputs.full-image-base }},push-by-digest=true,name-canonical=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ steps.platform.outputs.image-slug }}-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    outputs:
+      digest: ${{ steps.inspect.outputs.digest }}
+      full-image: ${{ needs.prepare.outputs.full-image }}
+    steps:
+      - name: Compute image slug
+        id: slugs
+        run: |
+          IMAGE_NAME="${{ inputs.image-name }}"
+          echo "image-slug=${IMAGE_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ steps.slugs.outputs.image-slug }}-*
+          merge-multiple: true
+
+      - name: Login to Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry == 'ghcr.io' && github.actor || secrets.registry-username }}
+          password: ${{ inputs.registry == 'ghcr.io' && secrets.GITHUB_TOKEN || secrets.registry-password }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create multi-arch manifest and push tags
+        working-directory: /tmp/digests
+        run: |
+          FULL_IMAGE_BASE="${{ needs.prepare.outputs.full-image-base }}"
+          TAGS="${{ needs.prepare.outputs.tags }}"
+
+          # Build the tag arguments for imagetools create
+          TAG_ARGS=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && TAG_ARGS+=("-t" "$tag")
+          done <<< "$TAGS"
+
+          # Build the digest source arguments
+          DIGEST_ARGS=()
+          for digest_file in *; do
+            DIGEST_ARGS+=("${FULL_IMAGE_BASE}@sha256:${digest_file}")
+          done
+
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${DIGEST_ARGS[@]}"
+
+      - name: Inspect manifest
+        id: inspect
+        run: |
+          FULL_IMAGE="${{ needs.prepare.outputs.full-image }}"
+          INSPECT_OUTPUT=$(docker buildx imagetools inspect "$FULL_IMAGE")
+          echo "$INSPECT_OUTPUT"
+          DIGEST=$(echo "$INSPECT_OUTPUT" | grep -m1 '^Digest:' | awk '{print $2}')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Create release summary
+        shell: bash
+        run: |
+          # Build platform list from input
+          PLATFORMS=$(echo '${{ inputs.platforms }}' | jq -r '.[].arch' | paste -sd ', ')
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Docker Image Published
+
+          - **Registry:** \`${{ inputs.registry }}\`
+          - **Image:** \`${{ needs.prepare.outputs.full-image-base }}\`
+          - **Version:** \`${{ inputs.version }}\`
+          - **Platforms:** \`${PLATFORMS}\`
+          - **Latest tag:** ${{ needs.prepare.outputs.update-latest == 'true' && 'Published' || 'Skipped (maintenance branch)' }}
+          - **Digest:** \`${{ steps.inspect.outputs.digest }}\`
+
+          ### Pull Commands
+
+          \`\`\`bash
+          # Versioned image
+          docker pull ${{ needs.prepare.outputs.full-image-base }}:${{ inputs.version }}
+
+          # Latest image
+          docker pull ${{ needs.prepare.outputs.full-image-base }}:latest
+          \`\`\`
+
+          ### Build Information
+
+          - **Dockerfile:** \`${{ inputs.dockerfile }}\`
+          - **Context:** \`${{ inputs.context }}\`
+          - **Target:** \`${{ inputs.target || '(default)' }}\`
+          - **Commit:** \`${{ github.sha }}\`
+          EOF

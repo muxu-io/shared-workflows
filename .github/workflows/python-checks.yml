@@ -1,0 +1,197 @@
+name: Reusable Python Checks
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON-encoded runner label (e.g. '"ubuntu-latest"') or label array
+          (e.g. '["self-hosted","linux"]'). Empty = use vars.CI_RUNNER or
+          ubuntu-latest.
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: 'Working directory for Python project'
+        required: false
+        type: string
+        default: '.'
+      system-dependencies:
+        description: 'Additional system dependencies to install (space-separated)'
+        required: false
+        type: string
+      test-timeout:
+        description: 'Timeout for pytest in seconds'
+        required: false
+        type: string
+        default: '600'
+      pip-audit-ignore-vulns:
+        description: 'Space-separated list of vulnerability IDs to ignore in pip-audit (e.g., "GHSA-xxx CVE-yyy")'
+        required: false
+        type: string
+        default: ''
+      pytest-args:
+        description: 'Additional pytest arguments (e.g., "-s" for output, "-vv" for very verbose)'
+        required: false
+        type: string
+        default: ''
+      env-setup:
+        description: 'Shell commands to set test environment variables (should write to $GITHUB_ENV). Example: echo "GST_DEBUG=3" >> $GITHUB_ENV'
+        required: false
+        type: string
+        default: ''
+      submodules:
+        description: 'Checkout git submodules (true, false, or recursive)'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      success:
+        description: 'Whether all checks passed'
+        value: ${{ jobs.summary.outputs.success }}
+
+jobs:
+  commit-validation:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Commit Validation
+        uses: muxu-io/shared-workflows/.github/actions/commit-validation@master
+
+  code-quality:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Code Quality
+        uses: muxu-io/shared-workflows/.github/actions/code-quality@master
+        with:
+          python-version: '3.11'
+          working-directory: ${{ inputs.working-directory }}
+          system-dependencies: ${{ inputs.system-dependencies }}
+
+  security-scan:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Free up disk space
+        uses: muxu-io/shared-workflows/.github/actions/free-disk-space@master
+
+      - name: Security Scan
+        uses: muxu-io/shared-workflows/.github/actions/security-scan@master
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          system-dependencies: ${{ inputs.system-dependencies }}
+          pip-audit-ignore-vulns: ${{ inputs.pip-audit-ignore-vulns }}
+
+  testing:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ['3.11', '3.12', '3.13']
+    steps:
+      - name: Generate GitHub App Token
+        if: inputs.submodules
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.SEMANTIC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.SEMANTIC_RELEASE_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: true
+          submodules: ${{ inputs.submodules }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Free up disk space
+        uses: muxu-io/shared-workflows/.github/actions/free-disk-space@master
+
+      - name: Setup test environment variables
+        if: inputs.env-setup
+        shell: bash
+        run: |
+          echo "Running test environment setup..."
+          ${{ inputs.env-setup }}
+          echo "Test environment setup complete."
+
+      - name: Testing
+        uses: muxu-io/shared-workflows/.github/actions/testing@master
+        with:
+          python-version: ${{ matrix.python-version }}
+          working-directory: ${{ inputs.working-directory }}
+          timeout: ${{ inputs.test-timeout }}
+          system-dependencies: ${{ inputs.system-dependencies }}
+          pytest-args: ${{ inputs.pytest-args }}
+
+  build:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Build
+        uses: muxu-io/shared-workflows/.github/actions/build@master
+        with:
+          python-version: '3.11'
+          working-directory: ${{ inputs.working-directory }}
+          system-dependencies: ${{ inputs.system-dependencies }}
+
+  summary:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    needs: [commit-validation, code-quality, security-scan, testing, build]
+    if: always()
+    outputs:
+      success: ${{ steps.check.outputs.success }}
+    steps:
+      - name: Summary
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "Python checks workflow completed"
+          echo "commit-validation: ${{ needs.commit-validation.result }}"
+          echo "code-quality: ${{ needs.code-quality.result }}"
+          echo "security-scan: ${{ needs.security-scan.result }}"
+          echo "testing: ${{ needs.testing.result }}"
+          echo "build: ${{ needs.build.result }}"
+
+          # Check if any job failed (ignoring skipped jobs)
+          if [[ "${{ needs.commit-validation.result }}" == "failure" ]] || \
+             [[ "${{ needs.code-quality.result }}" == "failure" ]] || \
+             [[ "${{ needs.security-scan.result }}" == "failure" ]] || \
+             [[ "${{ needs.testing.result }}" == "failure" ]] || \
+             [[ "${{ needs.build.result }}" == "failure" ]]; then
+            echo "❌ One or more checks failed"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          elif [[ "${{ needs.commit-validation.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.code-quality.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.security-scan.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.testing.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.build.result }}" == "cancelled" ]]; then
+            echo "❌ One or more checks were cancelled"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ All checks completed successfully"
+            echo "success=true" >> $GITHUB_OUTPUT
+          fi

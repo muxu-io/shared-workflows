@@ -1,0 +1,79 @@
+name: 'Code Quality'
+description: 'Code quality checks including Black formatting, Ruff linting, and ShellCheck for shell scripts'
+inputs:
+  python-version:
+    description: 'Python version being tested'
+    required: false
+    default: '3.11'
+  working-directory:
+    description: 'Working directory for Python project'
+    required: false
+    default: '.'
+  system-dependencies:
+    description: 'Additional system dependencies to install (space-separated)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y shellcheck
+
+        # Install additional system dependencies if provided
+        if [ -n "${{ inputs.system-dependencies }}" ]; then
+          echo "Installing additional system dependencies: ${{ inputs.system-dependencies }}"
+          sudo apt-get install -y ${{ inputs.system-dependencies }}
+        fi
+      shell: bash
+
+    - name: Install dependencies
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "Installing Poetry and dependencies"
+        python -m pip install --upgrade pip poetry
+
+        # Configure Poetry to use in-project virtual environment
+        poetry config virtualenvs.create true
+        poetry config virtualenvs.in-project true
+
+        poetry install
+      shell: bash
+
+    - name: Check code formatting with Black
+      working-directory: ${{ inputs.working-directory }}
+      run: poetry run black --check --diff .
+      shell: bash
+
+    - name: Lint with Ruff
+      working-directory: ${{ inputs.working-directory }}
+      run: poetry run ruff check .
+      shell: bash
+
+    - name: Lint shell scripts with ShellCheck
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        # Find and lint shell scripts if any exist
+        shell_files=$(find . -name "*.sh" -o -name "*.bash" -type f 2>/dev/null)
+        if [ -n "$shell_files" ]; then
+          echo "Found shell scripts, running ShellCheck:"
+          echo "$shell_files"
+          # Run shellcheck and capture exit code
+          find . -name "*.sh" -o -name "*.bash" -type f -exec shellcheck {} +
+          exit_code=$?
+          if [ $exit_code -ne 0 ]; then
+            echo "ShellCheck found issues in shell scripts"
+            exit $exit_code
+          fi
+          echo "All shell scripts passed ShellCheck"
+        else
+          echo "No shell scripts found, skipping ShellCheck"
+        fi
+      shell: bash
