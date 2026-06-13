@@ -78,6 +78,14 @@ jobs:
         run: |
           # Add missing semantic-release config (branches and commit parser options)
           if [ -f pyproject.toml ]; then
+            if ! grep -q 'version_toml' pyproject.toml; then
+              cat >> pyproject.toml << 'EOF'
+
+          [tool.semantic_release]
+          version_toml = ["pyproject.toml:project.version"]
+          EOF
+              echo "Added version_toml to pyproject.toml"
+            fi
             # Append branch config to existing pyproject.toml if not already present
             if ! grep -q 'tool.semantic_release.branches' pyproject.toml; then
               cat >> pyproject.toml << 'EOF'
