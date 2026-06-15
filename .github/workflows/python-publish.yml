@@ -1,0 +1,116 @@
+# GitLab PyPI Package Publish Workflow
+#
+
+name: Reusable Python Package Publish
+run-name: 'Publish to GitLab PyPI'
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: >-
+          JSON-encoded runner label (e.g. '"ubuntu-latest"') or label array
+          (e.g. '["self-hosted","linux"]'). Empty = use vars.CI_RUNNER or
+          ubuntu-latest.
+        required: false
+        type: string
+        default: ''
+      version:
+        description: 'Version to publish (informational; build reads pyproject.toml)'
+        required: false
+        type: string
+    secrets:
+      GITLAB_PYPI_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitlab-pypi-publish:
+    runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
+    environment:
+      name: gitlab-pypi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # The branch tip already carries the semantic-release version bump.
+          ref: ${{ github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+
+      - name: Build package
+        run: poetry build
+
+      - name: Verify artifacts
+        run: |
+          echo "Package artifacts:"
+          ls -la dist/
+          for file in dist/*.whl; do
+            if [ -f "$file" ]; then
+              echo "Contents of $file:"
+              python -m zipfile -l "$file" | head -20
+            fi
+          done
+
+      - name: Discover GitLab project
+        id: gitlab
+        env:
+          GITLAB_PYPI_TOKEN: ${{ secrets.GITLAB_PYPI_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
+        run: |
+          command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+
+          # GitLab project name == package name, verbatim (no prefix).
+          PACKAGE_NAME=$(python -c "import tomllib; d=tomllib.load(open('pyproject.toml','rb')); print(d.get('project', {}).get('name', d.get('tool', {}).get('poetry', {}).get('name', '')))" 2>/dev/null || echo "")
+          if [ -z "$PACKAGE_NAME" ]; then
+            echo "::error::Could not read package name from pyproject.toml"
+            exit 1
+          fi
+          echo "Discovering GitLab project for package: $PACKAGE_NAME"
+
+          # Primary: search projects the token's user can access, then match the
+          # exact name/path. Discovery only — never creates the project.
+          PROJECT_ID=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_PYPI_TOKEN" \
+            "https://gitlab.com/api/v4/projects?membership=true&search=${PACKAGE_NAME}&per_page=100" \
+            | jq -r ".[] | select(.path == \"${PACKAGE_NAME}\" or .name == \"${PACKAGE_NAME}\") | .id" \
+            | head -n1)
+
+          # Fallback: direct path lookup under the GitHub owner's namespace
+          # (the GitLab group/user mirrors the GitHub org, e.g. muxu-io/<pkg>).
+          # Resolves group-hosted projects the membership search may miss.
+          if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+            ENCODED_PATH=$(printf '%s/%s' "$GH_OWNER" "$PACKAGE_NAME" | sed 's/\//%2F/g')
+            echo "Membership search empty; trying direct path lookup: ${GH_OWNER}/${PACKAGE_NAME}"
+            PROJECT_ID=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_PYPI_TOKEN" \
+              "https://gitlab.com/api/v4/projects/${ENCODED_PATH}" \
+              | jq -r '.id // empty')
+          fi
+
+          if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+            echo "::error::GitLab project '${PACKAGE_NAME}' not found (searched membership + path '${GH_OWNER}/${PACKAGE_NAME}'). Create it manually before publishing."
+            exit 1
+          fi
+
+          echo "Found GitLab project id: $PROJECT_ID"
+          {
+            echo "project-id=$PROJECT_ID"
+            echo "package-name=$PACKAGE_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish to GitLab PyPI Repository
+        env:
+          GITLAB_PYPI_TOKEN: ${{ secrets.GITLAB_PYPI_TOKEN }}
+        run: |
+          poetry config repositories.gitlab https://gitlab.com/api/v4/projects/${{ steps.gitlab.outputs.project-id }}/packages/pypi
+          poetry config http-basic.gitlab __token__ "$GITLAB_PYPI_TOKEN"
+          poetry publish --repository gitlab

@@ -37,7 +37,15 @@ permissions:
   id-token: write
 
 jobs:
+  checks:
+    if: github.ref_type != 'tag' && github.event.head_commit.author.email != 'semantic-release'
+    uses: muxu-io/shared-workflows/.github/workflows/python-checks.yml@master
+    with:
+      runs-on: ${{ inputs.runs-on }}
+    secrets: inherit
+
   semantic-release:
+    needs: checks
     runs-on: ${{ fromJSON(inputs.runs-on != '' && inputs.runs-on || vars.CI_RUNNER != '' && vars.CI_RUNNER || '"ubuntu-latest"') }}
     # Skip if triggered by tag push or by semantic-release's own commits
     if: github.ref_type != 'tag' && github.event.head_commit.author.email != 'semantic-release'
